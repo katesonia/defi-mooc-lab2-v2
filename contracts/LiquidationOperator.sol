@@ -313,14 +313,14 @@ contract LiquidationOperator is IUniswapV2Callee {
             DataTypes.ReserveData memory reserve = pool.getReserveData(
                 reserves[i]
             );
-            string memory symbol = IERC20(reserves[i]).symbol();
-            uint256 decimals = IERC20(reserves[i]).decimals();
             // if use as debt.
             if (userConfig.isBorrowing(reserve.id)) {
                 uint256 stableDebt = IERC20(reserve.stableDebtTokenAddress)
                     .balanceOf(user);
                 uint256 variableDebt = IERC20(reserve.variableDebtTokenAddress)
                     .balanceOf(user);
+                string memory symbol = IERC20(reserves[i]).symbol();
+                uint256 decimals = IERC20(reserves[i]).decimals();
                 console.log(
                     "user debt %s: stableDebt %s, variableDebt %s",
                     symbol,
@@ -333,6 +333,8 @@ contract LiquidationOperator is IUniswapV2Callee {
                 uint256 collateral = IERC20(reserve.aTokenAddress).balanceOf(
                     user
                 );
+                string memory symbol = IERC20(reserves[i]).symbol();
+                uint256 decimals = IERC20(reserves[i]).decimals();
                 console.log(
                     "user collateral %s: %s",
                     symbol,
