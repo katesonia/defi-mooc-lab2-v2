@@ -49,6 +49,28 @@ interface ILendingPool {
             uint256 ltv,
             uint256 healthFactor
         );
+
+    /**
+     * @dev Returns the state and configuration of the reserve
+     * @param asset The address of the underlying asset of the reserve
+     * @return The state of the reserve
+     **/
+    function getReserveData(address asset)
+        external
+        view
+        returns (DataTypes.ReserveData memory);
+
+    function getReservesList() external view returns (address[] memory);
+
+    /**
+     * @dev Returns the configuration of the user across all the reserves
+     * @param user The user address
+     * @return The configuration of the user
+     **/
+    function getUserConfiguration(address user)
+        external
+        view
+        returns (DataTypes.UserConfigurationMap memory);
 }
 
 // UniswapV2
@@ -72,6 +94,10 @@ interface IERC20 {
      * Lets msg.sender send pool tokens to an address.
      **/
     function transfer(address to, uint256 value) external returns (bool);
+
+    function symbol() external view returns (string memory);
+
+    function decimals() external view returns (uint8);
 }
 
 // https://github.com/Uniswap/v2-periphery/blob/master/contracts/interfaces/IWETH.sol
@@ -130,13 +156,100 @@ interface IUniswapV2Pair {
         );
 }
 
+// ----------------------LIBRARIES-----------------------------------
+
+library DataTypes {
+    // refer to the whitepaper, section 1.1 basic concepts for a formal description of these properties.
+    struct ReserveData {
+        //stores the reserve configuration
+        ReserveConfigurationMap configuration;
+        //the liquidity index. Expressed in ray
+        uint128 liquidityIndex;
+        //variable borrow index. Expressed in ray
+        uint128 variableBorrowIndex;
+        //the current supply rate. Expressed in ray
+        uint128 currentLiquidityRate;
+        //the current variable borrow rate. Expressed in ray
+        uint128 currentVariableBorrowRate;
+        //the current stable borrow rate. Expressed in ray
+        uint128 currentStableBorrowRate;
+        uint40 lastUpdateTimestamp;
+        //tokens addresses
+        address aTokenAddress;
+        address stableDebtTokenAddress;
+        address variableDebtTokenAddress;
+        //address of the interest rate strategy
+        address interestRateStrategyAddress;
+        //the id of the reserve. Represents the position in the list of the active reserves
+        uint8 id;
+    }
+
+    struct ReserveConfigurationMap {
+        //bit 0-15: LTV
+        //bit 16-31: Liq. threshold
+        //bit 32-47: Liq. bonus
+        //bit 48-55: Decimals
+        //bit 56: Reserve is active
+        //bit 57: reserve is frozen
+        //bit 58: borrowing is enabled
+        //bit 59: stable rate borrowing enabled
+        //bit 60-63: reserved
+        //bit 64-79: reserve factor
+        uint256 data;
+    }
+
+    struct UserConfigurationMap {
+        uint256 data;
+    }
+}
+
+library UserConfiguration {
+    /**
+     * @dev Used to validate if a user has been using the reserve for borrowing
+     * @param self The configuration object
+     * @param reserveIndex The index of the reserve in the bitmap
+     * @return True if the user has been using a reserve for borrowing, false otherwise
+     **/
+    function isBorrowing(
+        DataTypes.UserConfigurationMap memory self,
+        uint256 reserveIndex
+    ) internal pure returns (bool) {
+        require(reserveIndex < 128, "INVALID INDEX! has to be less than 128.");
+        return (self.data >> (reserveIndex * 2)) & 1 != 0;
+    }
+
+    /**
+     * @dev Used to validate if a user has been using the reserve as collateral
+     * @param self The configuration object
+     * @param reserveIndex The index of the reserve in the bitmap
+     * @return True if the user has been using a reserve as collateral, false otherwise
+     **/
+    function isUsingAsCollateral(
+        DataTypes.UserConfigurationMap memory self,
+        uint256 reserveIndex
+    ) internal pure returns (bool) {
+        require(reserveIndex < 128, "INVALID INDEX! has to be less than 128.");
+        return (self.data >> (reserveIndex * 2 + 1)) & 1 != 0;
+    }
+}
+
 // ----------------------IMPLEMENTATION------------------------------
 
 contract LiquidationOperator is IUniswapV2Callee {
     uint8 public constant health_factor_decimals = 18;
 
     // TODO: define constants used in the contract including ERC-20 tokens, Uniswap Pairs, Aave lending pools, etc. */
-    //    *** Your code here ***
+    address private USER = 0x59CE4a2AC5bC3f5F225439B2993b86B42f6d3e9F;
+    address private AAVE_LENDING_POOL =
+        0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9;
+    address private UNI_FACTORY = 0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f;
+    // WBTC < WETH < USDT
+    address private USDT = 0xdAC17F958D2ee523a2206206994597C13D831ec7;
+    address private WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+    address private WBTC = 0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599;
+
+    using UserConfiguration for DataTypes.UserConfigurationMap;
+
     // END TODO
 
     // some helper function, it is totally fine if you can finish the lab without using these function
@@ -177,6 +290,59 @@ contract LiquidationOperator is IUniswapV2Callee {
         amountIn = (numerator / denominator) + 1;
     }
 
+    // Return user debt for asset.
+    function getUserDebt(address user, address asset)
+        private
+        view
+        returns (uint256 stableDebt, uint256 variableDebt)
+    {
+        DataTypes.ReserveData memory reserve = ILendingPool(AAVE_LENDING_POOL)
+            .getReserveData(asset);
+        stableDebt = IERC20(reserve.stableDebtTokenAddress).balanceOf(user);
+        variableDebt = IERC20(reserve.variableDebtTokenAddress).balanceOf(user);
+    }
+
+    function printUserPosition(address user) private view {
+        ILendingPool pool = ILendingPool(AAVE_LENDING_POOL);
+        // Get reserves and user config.
+        address[] memory reserves = pool.getReservesList();
+        DataTypes.UserConfigurationMap memory userConfig = pool
+            .getUserConfiguration(user);
+
+        for (uint256 i = 0; i < reserves.length; i++) {
+            DataTypes.ReserveData memory reserve = pool.getReserveData(
+                reserves[i]
+            );
+            string memory symbol = IERC20(reserves[i]).symbol();
+            uint256 decimals = IERC20(reserves[i]).decimals();
+            // if use as debt.
+            if (userConfig.isBorrowing(reserve.id)) {
+                uint256 stableDebt = IERC20(reserve.stableDebtTokenAddress)
+                    .balanceOf(user);
+                uint256 variableDebt = IERC20(reserve.variableDebtTokenAddress)
+                    .balanceOf(user);
+                console.log(
+                    "user debt %s: stableDebt %s, variableDebt %s",
+                    symbol,
+                    stableDebt / 10**decimals,
+                    variableDebt / 10**decimals
+                );
+            }
+            // if use as collateral.
+            if (userConfig.isUsingAsCollateral(reserve.id)) {
+                uint256 collateral = IERC20(reserve.aTokenAddress).balanceOf(
+                    user
+                );
+                console.log(
+                    "user collateral %s: %s",
+                    symbol,
+                    collateral / 10**decimals
+                );
+            }
+            // skip.
+        }
+    }
+
     constructor() {
         // TODO: (optional) initialize your contract
         //   *** Your code here ***
@@ -190,12 +356,21 @@ contract LiquidationOperator is IUniswapV2Callee {
     // required by the testing script, entry for your liquidation call
     function operate() external {
         // TODO: implement your liquidation logic
-
         // 0. security checks and initializing variables
-        //    *** Your code here ***
-
+        uint256 healthFactor;
         // 1. get the target user account data & make sure it is liquidatable
-        //    *** Your code here ***
+        (, , , , , healthFactor) = ILendingPool(AAVE_LENDING_POOL)
+            .getUserAccountData(USER);
+        require(healthFactor < 1e18, "user cannot be liquidated.");
+        // uint256 stableDebt;
+        // uint256 variableDebt;
+        // (stableDebt, variableDebt) = getUserDebt(USER, USDT);
+        // console.log(
+        //     "stableDebt %s, variableDebt %s",
+        //     stableDebt / 1e6,
+        //     variableDebt / 1e6
+        // );
+        printUserPosition(USER);
 
         // 2. call flash swap to liquidate the target user
         // based on https://etherscan.io/tx/0xac7df37a43fab1b130318bbb761861b8357650db2e2c6493b73d6da3d9581077
@@ -203,10 +378,8 @@ contract LiquidationOperator is IUniswapV2Callee {
         // we should borrow USDT, liquidate the target user and get the WBTC, then swap WBTC to repay uniswap
         // (please feel free to develop other workflows as long as they liquidate the target user successfully)
         //    *** Your code here ***
-
         // 3. Convert the profit into ETH and send back to sender
         //    *** Your code here ***
-
         // END TODO
     }
 
@@ -218,19 +391,14 @@ contract LiquidationOperator is IUniswapV2Callee {
         bytes calldata
     ) external override {
         // TODO: implement your liquidation logic
-
         // 2.0. security checks and initializing variables
         //    *** Your code here ***
-
         // 2.1 liquidate the target user
         //    *** Your code here ***
-
         // 2.2 swap WBTC for other things or repay directly
         //    *** Your code here ***
-
         // 2.3 repay
         //    *** Your code here ***
-        
         // END TODO
     }
 }
