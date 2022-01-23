@@ -71,6 +71,16 @@ interface ILendingPool {
         external
         view
         returns (DataTypes.UserConfigurationMap memory);
+
+    /**
+     * @dev Returns the configuration of the reserve
+     * @param asset The address of the underlying asset of the reserve
+     * @return The configuration of the reserve
+     **/
+    function getConfiguration(address asset)
+        external
+        view
+        returns (DataTypes.ReserveConfigurationMap memory);
 }
 
 // UniswapV2
@@ -156,6 +166,10 @@ interface IUniswapV2Pair {
         );
 }
 
+interface IPriceOracleGetter {
+    function getAssetPrice(address _asset) external view returns (uint256);
+}
+
 // ----------------------LIBRARIES-----------------------------------
 
 library DataTypes {
@@ -233,6 +247,26 @@ library UserConfiguration {
     }
 }
 
+library ReserveConfiguration {
+    uint256 constant LIQUIDATION_BONUS_MASK = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF0000FFFFFFFF; // prettier-ignore
+    uint256 constant LIQUIDATION_BONUS_START_BIT_POSITION = 32;
+
+    /**
+     * @dev Gets the liquidation bonus of the reserve
+     * @param self The reserve configuration
+     * @return The liquidation bonus
+     **/
+    function getLiquidationBonus(DataTypes.ReserveConfigurationMap memory self)
+        internal
+        pure
+        returns (uint256)
+    {
+        return
+            (self.data & ~LIQUIDATION_BONUS_MASK) >>
+            LIQUIDATION_BONUS_START_BIT_POSITION;
+    }
+}
+
 // ----------------------IMPLEMENTATION------------------------------
 
 contract LiquidationOperator is IUniswapV2Callee {
@@ -245,9 +279,16 @@ contract LiquidationOperator is IUniswapV2Callee {
     address private UNI_FACTORY = 0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f;
     // WBTC < WETH < USDT
     address private USDT = 0xdAC17F958D2ee523a2206206994597C13D831ec7;
+    uint256 private USDT_DECIMALS = IERC20(USDT).decimals();
     address private WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+    uint256 private WETH_DECIMALS = IERC20(WETH).decimals();
     address private WBTC = 0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599;
+    uint256 private WBTC_DECIMALS = IERC20(WBTC).decimals();
+    address private PRICE_ORACLE = 0xA50ba011c48153De246E5192C8f9258A2ba79Ca9;
+    // decimals for close factor is 3.
+    uint256 private CLOSE_FACTOR = 500;
 
+    using ReserveConfiguration for DataTypes.ReserveConfigurationMap;
     using UserConfiguration for DataTypes.UserConfigurationMap;
 
     // END TODO
@@ -294,12 +335,34 @@ contract LiquidationOperator is IUniswapV2Callee {
     function getUserDebt(address user, address asset)
         private
         view
-        returns (uint256 stableDebt, uint256 variableDebt)
+        returns (uint256)
     {
         DataTypes.ReserveData memory reserve = ILendingPool(AAVE_LENDING_POOL)
             .getReserveData(asset);
-        stableDebt = IERC20(reserve.stableDebtTokenAddress).balanceOf(user);
-        variableDebt = IERC20(reserve.variableDebtTokenAddress).balanceOf(user);
+        uint256 stableDebt = IERC20(reserve.stableDebtTokenAddress).balanceOf(
+            user
+        );
+        uint256 variableDebt = IERC20(reserve.variableDebtTokenAddress)
+            .balanceOf(user);
+        return stableDebt + variableDebt;
+    }
+
+    function getUserCollateral(address user, address asset)
+        private
+        view
+        returns (uint256)
+    {
+        DataTypes.ReserveData memory reserve = ILendingPool(AAVE_LENDING_POOL)
+            .getReserveData(asset);
+        return IERC20(reserve.aTokenAddress).balanceOf(user);
+    }
+
+    function getLiquidationBonus(address asset) private view returns (uint256) {
+        DataTypes.ReserveConfigurationMap memory configuration = ILendingPool(
+            AAVE_LENDING_POOL
+        ).getConfiguration(asset);
+
+        return configuration.getLiquidationBonus();
     }
 
     function printUserPosition(address user) private view {
@@ -345,6 +408,48 @@ contract LiquidationOperator is IUniswapV2Callee {
         }
     }
 
+    // Get the maximum amount of collateral we can liquidate and corresponding repayment.
+    function maxLiquidatableCollateral(
+        address debtToken,
+        address collateralToken,
+        uint256 debtAmount,
+        uint256 collateralAmount,
+        uint256 collateralLiquidationBonus // decimal 4
+    )
+        private
+        view
+        returns (uint256 maxCollateralAmount, uint256 maxRepayAmount)
+    {
+        // TODO: implementation.
+        IPriceOracleGetter oracle = IPriceOracleGetter(PRICE_ORACLE);
+        uint256 debtTokenPriceEth = oracle.getAssetPrice(debtToken);
+        uint256 debtTokenDecimals = IERC20(debtToken).decimals();
+        uint256 repayEthUpToCloseFactor = (((debtTokenPriceEth * debtAmount) /
+            10**debtTokenDecimals) * CLOSE_FACTOR) / 1000;
+
+        uint256 collateralTokenPriceEth = oracle.getAssetPrice(collateralToken);
+        console.log("WBTC price in eth: ", collateralTokenPriceEth);
+        uint256 collateralTokenDecimals = IERC20(collateralToken).decimals();
+        uint256 repayEthToGetMaxCollateral = (((collateralTokenPriceEth *
+            collateralAmount) / 10**collateralTokenDecimals) * 10000) /
+            collateralLiquidationBonus;
+
+        if (repayEthUpToCloseFactor <= repayEthToGetMaxCollateral) {
+            maxRepayAmount =
+                (repayEthUpToCloseFactor * 10**debtTokenDecimals) /
+                debtTokenPriceEth;
+            maxCollateralAmount =
+                (((repayEthUpToCloseFactor * 10**collateralTokenDecimals) /
+                    collateralTokenPriceEth) * collateralLiquidationBonus) /
+                10000;
+        } else {
+            maxCollateralAmount = collateralAmount;
+            maxRepayAmount =
+                (repayEthToGetMaxCollateral * 10**debtTokenDecimals) /
+                debtTokenPriceEth;
+        }
+    }
+
     constructor() {
         // TODO: (optional) initialize your contract
         //   *** Your code here ***
@@ -364,16 +469,20 @@ contract LiquidationOperator is IUniswapV2Callee {
         (, , , , , healthFactor) = ILendingPool(AAVE_LENDING_POOL)
             .getUserAccountData(USER);
         require(healthFactor < 1e18, "user cannot be liquidated.");
-        // uint256 stableDebt;
-        // uint256 variableDebt;
-        // (stableDebt, variableDebt) = getUserDebt(USER, USDT);
-        // console.log(
-        //     "stableDebt %s, variableDebt %s",
-        //     stableDebt / 1e6,
-        //     variableDebt / 1e6
-        // );
-        printUserPosition(USER);
-
+        // Print user position to get necessarily information.
+        // printUserPosition(USER);
+        uint256 debtUsdt = getUserDebt(USER, USDT);
+        uint256 collateralWbtc = getUserCollateral(USER, WBTC);
+        uint256 wbtcLiquidationBonus = getLiquidationBonus(WBTC);
+        uint256 maxLiquidatableWbtc;
+        uint256 maxRepayableUsdt;
+        (maxLiquidatableWbtc, maxRepayableUsdt) = maxLiquidatableCollateral(
+            USDT,
+            WBTC,
+            debtUsdt,
+            collateralWbtc,
+            wbtcLiquidationBonus
+        );
         // 2. call flash swap to liquidate the target user
         // based on https://etherscan.io/tx/0xac7df37a43fab1b130318bbb761861b8357650db2e2c6493b73d6da3d9581077
         // we know that the target user borrowed USDT with WBTC as collateral
