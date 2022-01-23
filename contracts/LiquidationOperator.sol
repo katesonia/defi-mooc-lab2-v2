@@ -279,14 +279,11 @@ contract LiquidationOperator is IUniswapV2Callee {
     address private UNI_FACTORY = 0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f;
     // WBTC < WETH < USDT
     address private USDT = 0xdAC17F958D2ee523a2206206994597C13D831ec7;
-    uint256 private USDT_DECIMALS = IERC20(USDT).decimals();
     address private WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
-    uint256 private WETH_DECIMALS = IERC20(WETH).decimals();
     address private WBTC = 0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599;
-    uint256 private WBTC_DECIMALS = IERC20(WBTC).decimals();
     address private PRICE_ORACLE = 0xA50ba011c48153De246E5192C8f9258A2ba79Ca9;
-    // decimals for close factor is 3.
-    uint256 private CLOSE_FACTOR = 500;
+    // decimals for percentage close factor is 4.
+    uint256 private CLOSE_FACTOR = 5000;
 
     using ReserveConfiguration for DataTypes.ReserveConfigurationMap;
     using UserConfiguration for DataTypes.UserConfigurationMap;
@@ -332,7 +329,7 @@ contract LiquidationOperator is IUniswapV2Callee {
     }
 
     // Return user debt for asset.
-    function getUserDebt(address user, address asset)
+    function _getUserDebt(address user, address asset)
         private
         view
         returns (uint256)
@@ -347,7 +344,7 @@ contract LiquidationOperator is IUniswapV2Callee {
         return stableDebt + variableDebt;
     }
 
-    function getUserCollateral(address user, address asset)
+    function _getUserCollateral(address user, address asset)
         private
         view
         returns (uint256)
@@ -357,7 +354,11 @@ contract LiquidationOperator is IUniswapV2Callee {
         return IERC20(reserve.aTokenAddress).balanceOf(user);
     }
 
-    function getLiquidationBonus(address asset) private view returns (uint256) {
+    function _getLiquidationBonus(address asset)
+        private
+        view
+        returns (uint256)
+    {
         DataTypes.ReserveConfigurationMap memory configuration = ILendingPool(
             AAVE_LENDING_POOL
         ).getConfiguration(asset);
@@ -365,7 +366,7 @@ contract LiquidationOperator is IUniswapV2Callee {
         return configuration.getLiquidationBonus();
     }
 
-    function printUserPosition(address user) private view {
+    function _printUserPosition(address user) private view {
         ILendingPool pool = ILendingPool(AAVE_LENDING_POOL);
         // Get reserves and user config.
         address[] memory reserves = pool.getReservesList();
@@ -408,8 +409,8 @@ contract LiquidationOperator is IUniswapV2Callee {
         }
     }
 
-    // Get the maximum amount of collateral we can liquidate and corresponding repayment.
-    function maxLiquidatableCollateral(
+    // Get the maximum amount of collateral we can liquidate and the corresponding debt repayment.
+    function _maxLiquidation(
         address debtToken,
         address collateralToken,
         uint256 debtAmount,
@@ -420,22 +421,32 @@ contract LiquidationOperator is IUniswapV2Callee {
         view
         returns (uint256 maxCollateralAmount, uint256 maxRepayAmount)
     {
-        // TODO: implementation.
         IPriceOracleGetter oracle = IPriceOracleGetter(PRICE_ORACLE);
         uint256 debtTokenPriceEth = oracle.getAssetPrice(debtToken);
         uint256 debtTokenDecimals = IERC20(debtToken).decimals();
-        uint256 repayEthUpToCloseFactor = (((debtTokenPriceEth * debtAmount) /
-            10**debtTokenDecimals) * CLOSE_FACTOR) / 1000;
+        // Repay up to close factor in eth: debtInEth * 50%
+        uint256 repayEthUpToCloseFactor = (debtTokenPriceEth *
+            debtAmount *
+            CLOSE_FACTOR) /
+            10000 /
+            10**debtTokenDecimals;
 
         uint256 collateralTokenPriceEth = oracle.getAssetPrice(collateralToken);
         uint256 collateralTokenDecimals = IERC20(collateralToken).decimals();
+        // Repay to get maximum collateral: collateralInEth / liqBonus
         uint256 repayEthToGetMaxCollateral = (collateralTokenPriceEth *
             collateralAmount *
             10000) /
             collateralLiquidationBonus /
             10**collateralTokenDecimals;
 
-        if (repayEthUpToCloseFactor <= repayEthToGetMaxCollateral) {
+        // Max collateral worth less than 50% of debt.
+        if (repayEthUpToCloseFactor > repayEthToGetMaxCollateral) {
+            maxCollateralAmount = collateralAmount;
+            maxRepayAmount =
+                (repayEthToGetMaxCollateral * 10**debtTokenDecimals) /
+                debtTokenPriceEth;
+        } else {
             maxRepayAmount =
                 (repayEthUpToCloseFactor * 10**debtTokenDecimals) /
                 debtTokenPriceEth;
@@ -445,11 +456,6 @@ contract LiquidationOperator is IUniswapV2Callee {
                     collateralLiquidationBonus) /
                 collateralTokenPriceEth /
                 10000;
-        } else {
-            maxCollateralAmount = collateralAmount;
-            maxRepayAmount =
-                (repayEthToGetMaxCollateral * 10**debtTokenDecimals) /
-                debtTokenPriceEth;
         }
     }
 
@@ -545,13 +551,14 @@ contract LiquidationOperator is IUniswapV2Callee {
             .getUserAccountData(USER);
         require(healthFactor < 1e18, "user cannot be liquidated.");
         // Print user position to get necessarily information.
-        // printUserPosition(USER);
-        uint256 debtUsdt = getUserDebt(USER, USDT);
-        uint256 collateralWbtc = getUserCollateral(USER, WBTC);
-        uint256 wbtcLiquidationBonus = getLiquidationBonus(WBTC);
-        uint256 maxLiquidatableWbtc;
-        uint256 maxRepayableUsdt;
-        (maxLiquidatableWbtc, maxRepayableUsdt) = maxLiquidatableCollateral(
+        // _printUserPosition(USER);
+        uint256 debtUsdt = _getUserDebt(USER, USDT);
+        uint256 collateralWbtc = _getUserCollateral(USER, WBTC);
+        uint256 wbtcLiquidationBonus = _getLiquidationBonus(WBTC);
+        uint256 maxCollateralWbtc;
+        uint256 maxRepayUsdt;
+        // Get maximum collateral to liquidate and the corresponding debt repayment.
+        (maxCollateralWbtc, maxRepayUsdt) = _maxLiquidation(
             USDT,
             WBTC,
             debtUsdt,
@@ -563,13 +570,14 @@ contract LiquidationOperator is IUniswapV2Callee {
         // we know that the target user borrowed USDT with WBTC as collateral
         // we should borrow USDT, liquidate the target user and get the WBTC, then swap WBTC to repay uniswap
         // (please feel free to develop other workflows as long as they liquidate the target user successfully)
-        // How much eth we can get out after we get the max amount of WBTC collateral from liquidation.
-        uint256 ethToBorrow = _getAmountOut(maxLiquidatableWbtc, WBTC, WETH);
+
+        // How much eth we can get out if we return the max amount of WBTC collateral from liquidation.
+        uint256 ethToBorrow = _getAmountOut(maxCollateralWbtc, WBTC, WETH);
         IUniswapV2Pair(IUniswapV2Factory(UNI_FACTORY).getPair(WBTC, WETH)).swap(
                 uint256(0),
                 ethToBorrow,
                 address(this),
-                abi.encode(maxRepayableUsdt)
+                abi.encode(maxRepayUsdt)
             );
 
         // 3. Convert the profit into ETH and send back to sender
@@ -598,7 +606,8 @@ contract LiquidationOperator is IUniswapV2Callee {
             "failed to borrow tokens!"
         );
         uint256 usdtToRepay = abi.decode(data, (uint256));
-        uint256 wethToSwapUsdt = _getAmountIn(usdtToRepay + 2, WETH, USDT);
+        // +1 in case of decimal round up issue.
+        uint256 wethToSwapUsdt = _getAmountIn(usdtToRepay + 1, WETH, USDT);
         _swap(wethToSwapUsdt, WETH, USDT);
         // 2.1 liquidate the target user
         IERC20(USDT).approve(AAVE_LENDING_POOL, type(uint256).max);
