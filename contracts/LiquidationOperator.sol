@@ -428,19 +428,22 @@ contract LiquidationOperator is IUniswapV2Callee {
             10**debtTokenDecimals) * CLOSE_FACTOR) / 1000;
 
         uint256 collateralTokenPriceEth = oracle.getAssetPrice(collateralToken);
-        console.log("WBTC price in eth: ", collateralTokenPriceEth);
         uint256 collateralTokenDecimals = IERC20(collateralToken).decimals();
-        uint256 repayEthToGetMaxCollateral = (((collateralTokenPriceEth *
-            collateralAmount) / 10**collateralTokenDecimals) * 10000) /
-            collateralLiquidationBonus;
+        uint256 repayEthToGetMaxCollateral = (collateralTokenPriceEth *
+            collateralAmount *
+            10000) /
+            collateralLiquidationBonus /
+            10**collateralTokenDecimals;
 
         if (repayEthUpToCloseFactor <= repayEthToGetMaxCollateral) {
             maxRepayAmount =
                 (repayEthUpToCloseFactor * 10**debtTokenDecimals) /
                 debtTokenPriceEth;
             maxCollateralAmount =
-                (((repayEthUpToCloseFactor * 10**collateralTokenDecimals) /
-                    collateralTokenPriceEth) * collateralLiquidationBonus) /
+                (repayEthUpToCloseFactor *
+                    10**collateralTokenDecimals *
+                    collateralLiquidationBonus) /
+                collateralTokenPriceEth /
                 10000;
         } else {
             maxCollateralAmount = collateralAmount;
@@ -450,6 +453,77 @@ contract LiquidationOperator is IUniswapV2Callee {
         }
     }
 
+    function _getAmountIn(
+        uint256 amountIn,
+        address tokenIn,
+        address tokenOut
+    ) private view returns (uint256) {
+        address pair = IUniswapV2Factory(UNI_FACTORY).getPair(
+            tokenIn,
+            tokenOut
+        );
+
+        uint256 reserve1;
+        uint256 reserve2;
+        (reserve1, reserve2, ) = IUniswapV2Pair(pair).getReserves();
+
+        uint256 reserveIn;
+        uint256 reserveOut;
+        (reserveIn, reserveOut) = tokenIn < tokenOut
+            ? (reserve1, reserve2)
+            : (reserve2, reserve1);
+        return getAmountIn(amountIn, reserveIn, reserveOut);
+    }
+
+    function _getAmountOut(
+        uint256 amountIn,
+        address tokenIn,
+        address tokenOut
+    ) private view returns (uint256) {
+        address pair = IUniswapV2Factory(UNI_FACTORY).getPair(
+            tokenIn,
+            tokenOut
+        );
+
+        uint256 reserve1;
+        uint256 reserve2;
+        (reserve1, reserve2, ) = IUniswapV2Pair(pair).getReserves();
+
+        uint256 reserveIn;
+        uint256 reserveOut;
+        (reserveIn, reserveOut) = tokenIn < tokenOut
+            ? (reserve1, reserve2)
+            : (reserve2, reserve1);
+        return getAmountOut(amountIn, reserveIn, reserveOut);
+    }
+
+    function _swap(
+        uint256 amountIn,
+        address tokenIn,
+        address tokenOut
+    ) private {
+        uint256 amountOut = _getAmountOut(amountIn, tokenIn, tokenOut);
+        address pair = IUniswapV2Factory(UNI_FACTORY).getPair(
+            tokenIn,
+            tokenOut
+        );
+        require(
+            IERC20(tokenIn).transfer(pair, amountIn),
+            "Failed to transfer!"
+        );
+        uint256 amount1;
+        uint256 amount2;
+        (amount1, amount2) = tokenIn < tokenOut
+            ? (uint256(0), amountOut)
+            : (amountOut, uint256(0));
+        IUniswapV2Pair(pair).swap(
+            amount1,
+            amount2,
+            address(this),
+            new bytes(0)
+        );
+    }
+
     constructor() {
         // TODO: (optional) initialize your contract
         //   *** Your code here ***
@@ -457,7 +531,8 @@ contract LiquidationOperator is IUniswapV2Callee {
     }
 
     // TODO: add a `receive` function so that you can withdraw your WETH
-    //   *** Your code here ***
+    receive() external payable {}
+
     // END TODO
 
     // required by the testing script, entry for your liquidation call
@@ -488,9 +563,22 @@ contract LiquidationOperator is IUniswapV2Callee {
         // we know that the target user borrowed USDT with WBTC as collateral
         // we should borrow USDT, liquidate the target user and get the WBTC, then swap WBTC to repay uniswap
         // (please feel free to develop other workflows as long as they liquidate the target user successfully)
-        //    *** Your code here ***
+        // How much eth we can get out after we get the max amount of WBTC collateral from liquidation.
+        uint256 ethToBorrow = _getAmountOut(maxLiquidatableWbtc, WBTC, WETH);
+        IUniswapV2Pair(IUniswapV2Factory(UNI_FACTORY).getPair(WBTC, WETH)).swap(
+                uint256(0),
+                ethToBorrow,
+                address(this),
+                abi.encode(maxRepayableUsdt)
+            );
+
         // 3. Convert the profit into ETH and send back to sender
-        //    *** Your code here ***
+        uint256 profitWeth = IERC20(WETH).balanceOf(address(this));
+        IWETH(WETH).withdraw(profitWeth);
+        require(
+            payable(msg.sender).send(address(this).balance),
+            "Failed to transfer profit to sender."
+        );
         // END TODO
     }
 
@@ -499,17 +587,39 @@ contract LiquidationOperator is IUniswapV2Callee {
         address,
         uint256,
         uint256 amount1,
-        bytes calldata
+        bytes calldata data
     ) external override {
         // TODO: implement your liquidation logic
         // 2.0. security checks and initializing variables
-        //    *** Your code here ***
+        uint256 wethAmount = amount1;
+        require(
+            IERC20(WETH).balanceOf(address(this)) == wethAmount &&
+                wethAmount > 0,
+            "failed to borrow tokens!"
+        );
+        uint256 usdtToRepay = abi.decode(data, (uint256));
+        uint256 wethToSwapUsdt = _getAmountIn(usdtToRepay + 2, WETH, USDT);
+        _swap(wethToSwapUsdt, WETH, USDT);
         // 2.1 liquidate the target user
-        //    *** Your code here ***
+        IERC20(USDT).approve(AAVE_LENDING_POOL, type(uint256).max);
+        ILendingPool(AAVE_LENDING_POOL).liquidationCall(
+            WBTC,
+            USDT,
+            USER,
+            type(uint256).max,
+            false
+        );
         // 2.2 swap WBTC for other things or repay directly
-        //    *** Your code here ***
+        uint256 btcProfit = IERC20(WBTC).balanceOf(address(this));
         // 2.3 repay
-        //    *** Your code here ***
+        address wbtcWethPair = IUniswapV2Factory(UNI_FACTORY).getPair(
+            WBTC,
+            WETH
+        );
+        require(
+            IERC20(WBTC).transfer(wbtcWethPair, btcProfit),
+            "Failed to transfer!"
+        );
         // END TODO
     }
 }
