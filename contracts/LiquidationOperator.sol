@@ -550,8 +550,9 @@ contract LiquidationOperator is IUniswapV2Callee {
         (, , , , , healthFactor) = ILendingPool(AAVE_LENDING_POOL)
             .getUserAccountData(USER);
         require(healthFactor < 1e18, "user cannot be liquidated.");
-        // Print user position to get necessarily information.
+        // Print user position to get necessary information.
         // _printUserPosition(USER);
+
         uint256 debtUsdt = _getUserDebt(USER, USDT);
         uint256 collateralWbtc = _getUserCollateral(USER, WBTC);
         uint256 wbtcLiquidationBonus = _getLiquidationBonus(WBTC);
